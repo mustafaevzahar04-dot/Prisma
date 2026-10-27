@@ -1,0 +1,2219 @@
+package com.prisma.app
+
+import android.content.Context
+import android.os.Build
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.*
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.datastore.preferences.core.*
+import androidx.datastore.preferences.preferencesDataStore
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import org.drinkless.tdlib.Client
+import org.drinkless.tdlib.TdApi
+import java.util.concurrent.ConcurrentHashMap
+
+// ============ ВПИШИ СВОИ ДАННЫЕ С my.telegram.org ============
+const val API_ID = 0
+const val API_HASH = ""
+// ==============================================================
+
+/* ---------------------- СТИЛИ ---------------------- */
+
+@Serializable
+data class ChatStyle(
+    val bubbleOut: Long = 0xFF6C5CE7,
+    val bubbleIn: Long = 0xFF2D3436,
+    val textOut: Long = 0xFFFFFFFF,
+    val textIn: Long = 0xFFEEEEEE,
+    val bgTop: Long = 0xFF0F0C29,
+    val bgBottom: Long = 0xFF302B63,
+    val corner: Int = 18,
+    val fontScale: Float = 1f
+)
+
+private val Context.ds by preferencesDataStore("prisma_styles")
+
+class StyleStore(private val ctx: Context) {
+    private val json = Json { ignoreUnknownKeys = true }
+    private fun key(id: Long) = stringPreferencesKey("chat_$id")
+    private fun decode(s: String?) =
+        s?.let { runCatching { json.decodeFromString<ChatStyle>(it) }.getOrNull() }
+
+    /** chatId = 0 — общий стиль для всех чатов */
+    fun styleFlow(chatId: Long): Flow<ChatStyle> = ctx.ds.data.map { p ->
+        decode(p[key(chatId)]) ?: decode(p[key(0)]) ?: ChatStyle()
+    }
+
+    suspend fun save(chatId: Long, s: ChatStyle) {
+        ctx.ds.edit { it[key(chatId)] = json.encodeToString(s) }
+    }
+
+    suspend fun reset(chatId: Long) {
+        ctx.ds.edit { it.remove(key(chatId)) }
+    }
+}
+
+/* ---------------------- TELEGRAM (TDLib) ---------------------- */
+
+object Td {
+    private lateinit var client: Client
+    private var started = false
+    private var dir = ""
+    private var currentChat = 0L
+    private val chatMap = ConcurrentHashMap<Long, TdApi.Chat>()
+
+    val auth = MutableStateFlow<TdApi.AuthorizationState?>(null)
+    val chats = MutableStateFlow<List<TdApi.Chat>>(emptyList())
+    val messages = MutableStateFlow<List<TdApi.Message>>(emptyList())
+    val me = MutableStateFlow<TdApi.User?>(null)
+
+    fun init(ctx: Context) {
+        if (started) return
+        started = true
+        dir = ctx.filesDir.absolutePath
+        Client.execute(TdApi.SetLogVerbosityLevel(1))
+        client = Client.create({ onUpdate(it) }, null, null)
+    }
+
+    fun send(f: TdApi.Function<*>, cb: ((TdApi.Object) -> Unit)? = null) {
+        client.send(f) { cb?.invoke(it) }
+    }
+
+    private fun push() {
+        chats.value = chatMap.values.sortedByDescending { it.lastMessage?.date ?: 0 }
+    }
+
+    private fun onUpdate(o: TdApi.Object) {
+        when (o) {
+            is TdApi.UpdateAuthorizationState -> onAuth(o.authorizationState)
+            is TdApi.UpdateNewChat -> { chatMap[o.chat.id] = o.chat; push() }
+            is TdApi.UpdateChatTitle -> { chatMap[o.chatId]?.title = o.title; push() }
+            is TdApi.UpdateChatLastMessage -> {
+                chatMap[o.chatId]?.lastMessage = o.lastMessage
+                push()
+            }
+            is TdApi.UpdateNewMessage ->
+                if (o.message.chatId == currentChat) messages.update { listOf(o.message) + it }
+            is TdApi.UpdateUser -> if (o.user.id == me.value?.id) me.value = o.user
+            else -> {}
+        }
+    }
+
+    private fun onAuth(s: TdApi.AuthorizationState) {
+        auth.value = s
+        when (s) {
+            is TdApi.AuthorizationStateWaitTdlibParameters -> send(
+                TdApi.SetTdlibParameters().apply {
+                    useTestDc = false
+                    databaseDirectory = "$dir/td"
+                    filesDirectory = "$dir/files"
+                    databaseEncryptionKey = ByteArray(0)
+                    useFileDatabase = true
+                    useChatInfoDatabase = true
+                    useMessageDatabase = true
+                    useSecretChats = false
+                    apiId = API_ID
+                    apiHash = API_HASH
+                    systemLanguageCode = "ru"
+                    deviceModel = Build.MODEL
+                    systemVersion = Build.VERSION.RELEASE
+                    applicationVersion = "0.1"
+                }
+            )
+            is TdApi.AuthorizationStateReady -> {
+                send(TdApi.LoadChats(TdApi.ChatListMain(), 100))
+                send(TdApi.GetMe()) { if (it is TdApi.User) me.value = it }
+            }
+            else -> {}
+        }
+    }
+
+    fun openChat(id: Long) {
+        currentChat = id
+        messages.value = emptyList()
+        send(TdApi.GetChatHistory(id, 0, 0, 50, false)) {
+            if (it is TdApi.Messages) messages.value = it.messages.toList()
+        }
+    }
+
+    fun sendText(chatId: Long, text: String) {
+        send(TdApi.SendMessage().apply {
+            this.chatId = chatId
+            inputMessageContent = TdApi.InputMessageText().apply {
+                this.text = TdApi.FormattedText(text, emptyArray())
+            }
+        })
+    }
+}
+
+fun preview(m: TdApi.Message?): String = when (val c = m?.content) {
+    null -> ""
+    is TdApi.MessageText -> c.text.text
+    else -> "📎 вложение"
+}
+
+/* ---------------------- ACTIVITY ---------------------- */
+
+sealed class Screen {
+    object Chats : Screen()
+    object Profile : Screen()
+    data class Chat(val id: Long, val title: String) : Screen()
+    data class Style(val id: Long, val title: String) : Screen()
+}
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        Td.init(applicationContext)
+        val store = StyleStore(applicationContext)
+        setContent {
+            MaterialTheme(colorScheme = darkColorScheme()) { PrismaApp(store) }
+        }
+    }
+}
+
+@Composable
+fun PrismaApp(store: StyleStore) {
+    val auth by Td.auth.collectAsState()
+    var screen by remember { mutableStateOf<Screen>(Screen.Chats) }
+    Surface(Modifier.fillMaxSize()) {
+        if (auth is TdApi.AuthorizationStateReady) {
+            when (val s = screen) {
+                is Screen.Chats -> ChatList(
+                    onOpen = { screen = Screen.Chat(it.id, it.title) },
+                    onProfile = { screen = Screen.Profile }
+                )
+                is Screen.Chat -> ChatScreen(
+                    s, store,
+                    back = { screen = Screen.Chats },
+                    edit = { screen = Screen.Style(s.id, s.title) }
+                )
+                is Screen.Profile -> ProfileScreen { screen = Screen.Chats }
+                is Screen.Style -> StyleScreen(s.id, store) { screen = Screen.Chat(s.id, s.title) }
+            }
+        } else LoginScreen(auth)
+    }
+}
+
+/* ---------------------- ВХОД ---------------------- */
+
+@Composable
+fun LoginScreen(state: TdApi.AuthorizationState?) {
+    var text by remember(state?.javaClass) { mutableStateOf("") }
+    val label: String
+    val go: () -> Unit
+    when (state) {
+        is TdApi.AuthorizationStateWaitPhoneNumber -> {
+            label = "Телефон (+7...)"
+            go = { Td.send(TdApi.SetAuthenticationPhoneNumber(text, null)) }
+        }
+        is TdApi.AuthorizationStateWaitCode -> {
+            label = "Код из Telegram"
+            go = { Td.send(TdApi.CheckAuthenticationCode(text)) }
+        }
+        is TdApi.AuthorizationStateWaitPassword -> {
+            label = "Пароль 2FA"
+            go = { Td.send(TdApi.CheckAuthenticationPassword(text)) }
+        }
+        else -> { label = "Подключение…"; go = {} }
+    }
+    Column(Modifier.fillMaxSize().padding(32.dp), Arrangement.Center) {
+        Text("Prisma", fontSize = 40.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(24.dp))
+        OutlinedTextField(
+            text, { text = it }, Modifier.fillMaxWidth(),
+            label = { Text(label) }, singleLine = true
+        )
+        Spacer(Modifier.height(16.dp))
+        Button(go, Modifier.fillMaxWidth()) { Text("Далее") }
+    }
+}
+
+/* ---------------------- СПИСОК ЧАТОВ ---------------------- */
+
+@Composable
+fun ChatList(onOpen: (TdApi.Chat) -> Unit, onProfile: () -> Unit) {
+    val chats by Td.chats.collectAsState()
+    val me by Td.me.collectAsState()
+    Column(Modifier.fillMaxSize().statusBarsPadding()) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+            Arrangement.SpaceBetween, Alignment.CenterVertically
+        ) {
+            Text("Prisma", fontSize = 26.sp, fontWeight = FontWeight.Bold)
+            TextButton(onProfile) { Text(me?.firstName ?: "Профиль") }
+        }
+        LazyColumn(Modifier.weight(1f)) {
+            items(chats, key = { it.id }) { c ->
+                Column(
+                    Modifier.fillMaxWidth().clickable { onOpen(c) }
+                        .padding(horizontal = 16.dp, vertical = 10.dp)
+                ) {
+                    Text(c.title, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                    Text(preview(c.lastMessage), color = Color.Gray, maxLines = 1)
+                }
+            }
+        }
+    }
+}
+
+/* ---------------------- ЭКРАН ЧАТА ---------------------- */
+
+@Composable
+fun ChatBackground(style: ChatStyle, content: @Composable BoxScope.() -> Unit) {
+    Box(
+        Modifier.fillMaxSize().background(
+            Brush.verticalGradient(listOf(Color(style.bgTop), Color(style.bgBottom)))
+        ),
+        content = content
+    )
+}
+
+@Composable
+fun MessageBubble(text: String, outgoing: Boolean, style: ChatStyle) {
+    val r = style.corner.dp
+    val shape = RoundedCornerShape(
+        topStart = r, topEnd = r,
+        bottomStart = if (outgoing) r else 4.dp,
+        bottomEnd = if (outgoing) 4.dp else r
+    )
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 3.dp),
+        horizontalArrangement = if (outgoing) Arrangement.End else Arrangement.Start
+    ) {
+        Box(
+            Modifier.widthIn(max = 300.dp)
+                .background(Color(if (outgoing) style.bubbleOut else style.bubbleIn), shape)
+                .padding(horizontal = 12.dp, vertical = 8.dp)
+        ) {
+            Text(
+                text,
+                color = Color(if (outgoing) style.textOut else style.textIn),
+                fontSize = (16 * style.fontScale).sp
+            )
+        }
+    }
+}
+
+@Composable
+fun ChatScreen(s: Screen.Chat, store: StyleStore, back: () -> Unit, edit: () -> Unit) {
+    val style by store.styleFlow(s.id).collectAsState(ChatStyle())
+    val msgs by Td.messages.collectAsState()
+    var input by remember { mutableStateOf("") }
+    LaunchedEffect(s.id) { Td.openChat(s.id) }
+    ChatBackground(style) {
+        Column(Modifier.fillMaxSize().statusBarsPadding().imePadding()) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                TextButton(back) { Text("←") }
+                Text(
+                    s.title, Modifier.weight(1f), color = Color.White,
+                    fontWeight = FontWeight.Bold, maxLines = 1
+                )
+                TextButton(edit) { Text("🎨") }
+            }
+            LazyColumn(Modifier.weight(1f), reverseLayout = true) {
+                items(msgs, key = { it.id }) {
+                    MessageBubble(preview(it), it.isOutgoing, style)
+                }
+            }
+            Row(
+                Modifier.fillMaxWidth().navigationBarsPadding().padding(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OutlinedTextField(
+                    input, { input = it }, Modifier.weight(1f),
+                    placeholder = { Text("Сообщение") }
+                )
+                Spacer(Modifier.width(8.dp))
+                Button({
+                    if (input.isNotBlank()) { Td.sendText(s.id, input.trim()); input = "" }
+                }) { Text("➤") }
+            }
+        }
+    }
+}
+
+/* ---------------------- ПРОФИЛЬ ---------------------- */
+
+@Composable
+fun ProfileScreen(back: () -> Unit) {
+    val me by Td.me.collectAsState()
+    var first by remember(me?.id) { mutableStateOf(me?.firstName ?: "") }
+    var last by remember(me?.id) { mutableStateOf(me?.lastName ?: "") }
+    var bio by remember { mutableStateOf("") }
+    var user by remember(me?.id) { mutableStateOf(me?.usernames?.editableUsername ?: "") }
+    Column(
+        Modifier.fillMaxSize().statusBarsPadding().padding(16.dp)
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        TextButton(back) { Text("← Назад") }
+        Text("Мой профиль", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+        OutlinedTextField(first, { first = it }, Modifier.fillMaxWidth(), label = { Text("Имя") })
+        OutlinedTextField(last, { last = it }, Modifier.fillMaxWidth(), label = { Text("Фамилия") })
+        OutlinedTextField(user, { user = it }, Modifier.fillMaxWidth(), label = { Text("Username") })
+        OutlinedTextField(bio, { bio = it }, Modifier.fillMaxWidth(), label = { Text("О себе") })
+        Button({
+            Td.send(TdApi.SetName(first, last))
+            Td.send(TdApi.SetBio(bio))
+            if (user.isNotBlank()) Td.send(TdApi.SetUsername(user))
+            back()
+        }, Modifier.fillMaxWidth()) { Text("Сохранить") }
+        OutlinedButton({ Td.send(TdApi.LogOut()) }, Modifier.fillMaxWidth()) { Text("Выйти") }
+    }
+}
+
+/* ---------------------- РЕДАКТОР ТЕМЫ ЧАТА ---------------------- */
+
+val PALETTE = listOf(
+    0xFF6C5CE7, 0xFFE84393, 0xFF0984E3, 0xFF00B894, 0xFFFDCB6E, 0xFFD63031,
+    0xFF2D3436, 0xFF0F0C29, 0xFF302B63, 0xFF1B1464, 0xFF6F1E51, 0xFF000000
+)
+
+@Composable
+fun Palette(sel: Long, pick: (Long) -> Unit) {
+    Row(
+        Modifier.horizontalScroll(rememberScrollState()).padding(vertical = 6.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        PALETTE.forEach { c ->
+            Box(
+                Modifier.size(36.dp).clip(CircleShape).background(Color(c))
+                    .border(if (c == sel) 3.dp else 1.dp, Color.White, CircleShape)
+                    .clickable { pick(c) }
+            )
+        }
+    }
+}
+
+@Composable
+fun StyleScreen(chatId: Long, store: StyleStore, done: () -> Unit) {
+    val saved by store.styleFlow(chatId).collectAsState(ChatStyle())
+    var st by remember(saved) { mutableStateOf(saved) }
+    val scope = rememberCoroutineScope()
+    ChatBackground(st) {
+        Column(
+            Modifier.fillMaxSize().statusBarsPadding().padding(12.dp)
+                .verticalScroll(rememberScrollState())
+        ) {
+            MessageBubble("Привет! Так выглядят чужие сообщения", false, st)
+            MessageBubble("А так — твои", true, st)
+            Spacer(Modifier.height(12.dp))
+            Text("Мои сообщения", color = Color.White)
+            Palette(st.bubbleOut) { st = st.copy(bubbleOut = it) }
+            Text("Чужие сообщения", color = Color.White)
+            Palette(st.bubbleIn) { st = st.copy(bubbleIn = it) }
+            Text("Фон сверху", color = Color.White)
+            Palette(st.bgTop) { st = st.copy(bgTop = it) }
+            Text("Фон снизу", color = Color.White)
+            Palette(st.bgBottom) { st = st.copy(bgBottom = it) }
+            Text("Скругление: ${st.corner}", color = Color.White)
+            Slider(st.corner.toFloat(), { st = st.copy(corner = it.toInt()) }, valueRange = 2f..32f)
+            Text("Размер текста: ${"%.1f".format(st.fontScale)}x", color = Color.White)
+            Slider(st.fontScale, { st = st.copy(fontScale = it) }, valueRange = 0.8f..1.6f)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button({ scope.launch { store.save(chatId, st); done() } }) { Text("Для чата") }
+                Button({ scope.launch { store.save(0, st); done() } }) { Text("Для всех") }
+                OutlinedButton({ scope.launch { store.reset(chatId); done() } }) { Text("Сброс") }
+            }
+        }
+    }
+}
+package com.prisma.app
+
+import android.content.Context
+import android.os.Build
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.*
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.datastore.preferences.core.*
+import androidx.datastore.preferences.preferencesDataStore
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import org.drinkless.tdlib.Client
+import org.drinkless.tdlib.TdApi
+import java.util.concurrent.ConcurrentHashMap
+
+// ============ ВПИШИ СВОИ ДАННЫЕ С my.telegram.org ============
+const val API_ID = 0
+const val API_HASH = ""
+// ==============================================================
+
+/* ---------------------- СТИЛИ ---------------------- */
+
+@Serializable
+data class ChatStyle(
+    val bubbleOut: Long = 0xFF6C5CE7,
+    val bubbleIn: Long = 0xFF2D3436,
+    val textOut: Long = 0xFFFFFFFF,
+    val textIn: Long = 0xFFEEEEEE,
+    val bgTop: Long = 0xFF0F0C29,
+    val bgBottom: Long = 0xFF302B63,
+    val corner: Int = 18,
+    val fontScale: Float = 1f
+)
+
+private val Context.ds by preferencesDataStore("prisma_styles")
+
+class StyleStore(private val ctx: Context) {
+    private val json = Json { ignoreUnknownKeys = true }
+    private fun key(id: Long) = stringPreferencesKey("chat_$id")
+    private fun decode(s: String?) =
+        s?.let { runCatching { json.decodeFromString<ChatStyle>(it) }.getOrNull() }
+
+    /** chatId = 0 — общий стиль для всех чатов */
+    fun styleFlow(chatId: Long): Flow<ChatStyle> = ctx.ds.data.map { p ->
+        decode(p[key(chatId)]) ?: decode(p[key(0)]) ?: ChatStyle()
+    }
+
+    suspend fun save(chatId: Long, s: ChatStyle) {
+        ctx.ds.edit { it[key(chatId)] = json.encodeToString(s) }
+    }
+
+    suspend fun reset(chatId: Long) {
+        ctx.ds.edit { it.remove(key(chatId)) }
+    }
+}
+
+/* ---------------------- TELEGRAM (TDLib) ---------------------- */
+
+object Td {
+    private lateinit var client: Client
+    private var started = false
+    private var dir = ""
+    private var currentChat = 0L
+    private val chatMap = ConcurrentHashMap<Long, TdApi.Chat>()
+
+    val auth = MutableStateFlow<TdApi.AuthorizationState?>(null)
+    val chats = MutableStateFlow<List<TdApi.Chat>>(emptyList())
+    val messages = MutableStateFlow<List<TdApi.Message>>(emptyList())
+    val me = MutableStateFlow<TdApi.User?>(null)
+
+    fun init(ctx: Context) {
+        if (started) return
+        started = true
+        dir = ctx.filesDir.absolutePath
+        Client.execute(TdApi.SetLogVerbosityLevel(1))
+        client = Client.create({ onUpdate(it) }, null, null)
+    }
+
+    fun send(f: TdApi.Function<*>, cb: ((TdApi.Object) -> Unit)? = null) {
+        client.send(f) { cb?.invoke(it) }
+    }
+
+    private fun push() {
+        chats.value = chatMap.values.sortedByDescending { it.lastMessage?.date ?: 0 }
+    }
+
+    private fun onUpdate(o: TdApi.Object) {
+        when (o) {
+            is TdApi.UpdateAuthorizationState -> onAuth(o.authorizationState)
+            is TdApi.UpdateNewChat -> { chatMap[o.chat.id] = o.chat; push() }
+            is TdApi.UpdateChatTitle -> { chatMap[o.chatId]?.title = o.title; push() }
+            is TdApi.UpdateChatLastMessage -> {
+                chatMap[o.chatId]?.lastMessage = o.lastMessage
+                push()
+            }
+            is TdApi.UpdateNewMessage ->
+                if (o.message.chatId == currentChat) messages.update { listOf(o.message) + it }
+            is TdApi.UpdateUser -> if (o.user.id == me.value?.id) me.value = o.user
+            else -> {}
+        }
+    }
+
+    private fun onAuth(s: TdApi.AuthorizationState) {
+        auth.value = s
+        when (s) {
+            is TdApi.AuthorizationStateWaitTdlibParameters -> send(
+                TdApi.SetTdlibParameters().apply {
+                    useTestDc = false
+                    databaseDirectory = "$dir/td"
+                    filesDirectory = "$dir/files"
+                    databaseEncryptionKey = ByteArray(0)
+                    useFileDatabase = true
+                    useChatInfoDatabase = true
+                    useMessageDatabase = true
+                    useSecretChats = false
+                    apiId = API_ID
+                    apiHash = API_HASH
+                    systemLanguageCode = "ru"
+                    deviceModel = Build.MODEL
+                    systemVersion = Build.VERSION.RELEASE
+                    applicationVersion = "0.1"
+                }
+            )
+            is TdApi.AuthorizationStateReady -> {
+                send(TdApi.LoadChats(TdApi.ChatListMain(), 100))
+                send(TdApi.GetMe()) { if (it is TdApi.User) me.value = it }
+            }
+            else -> {}
+        }
+    }
+
+    fun openChat(id: Long) {
+        currentChat = id
+        messages.value = emptyList()
+        send(TdApi.GetChatHistory(id, 0, 0, 50, false)) {
+            if (it is TdApi.Messages) messages.value = it.messages.toList()
+        }
+    }
+
+    fun sendText(chatId: Long, text: String) {
+        send(TdApi.SendMessage().apply {
+            this.chatId = chatId
+            inputMessageContent = TdApi.InputMessageText().apply {
+                this.text = TdApi.FormattedText(text, emptyArray())
+            }
+        })
+    }
+}
+
+fun preview(m: TdApi.Message?): String = when (val c = m?.content) {
+    null -> ""
+    is TdApi.MessageText -> c.text.text
+    else -> "📎 вложение"
+}
+
+/* ---------------------- ACTIVITY ---------------------- */
+
+sealed class Screen {
+    object Chats : Screen()
+    object Profile : Screen()
+    data class Chat(val id: Long, val title: String) : Screen()
+    data class Style(val id: Long, val title: String) : Screen()
+}
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        Td.init(applicationContext)
+        val store = StyleStore(applicationContext)
+        setContent {
+            MaterialTheme(colorScheme = darkColorScheme()) { PrismaApp(store) }
+        }
+    }
+}
+
+@Composable
+fun PrismaApp(store: StyleStore) {
+    val auth by Td.auth.collectAsState()
+    var screen by remember { mutableStateOf<Screen>(Screen.Chats) }
+    Surface(Modifier.fillMaxSize()) {
+        if (auth is TdApi.AuthorizationStateReady) {
+            when (val s = screen) {
+                is Screen.Chats -> ChatList(
+                    onOpen = { screen = Screen.Chat(it.id, it.title) },
+                    onProfile = { screen = Screen.Profile }
+                )
+                is Screen.Chat -> ChatScreen(
+                    s, store,
+                    back = { screen = Screen.Chats },
+                    edit = { screen = Screen.Style(s.id, s.title) }
+                )
+                is Screen.Profile -> ProfileScreen { screen = Screen.Chats }
+                is Screen.Style -> StyleScreen(s.id, store) { screen = Screen.Chat(s.id, s.title) }
+            }
+        } else LoginScreen(auth)
+    }
+}
+
+/* ---------------------- ВХОД ---------------------- */
+
+@Composable
+fun LoginScreen(state: TdApi.AuthorizationState?) {
+    var text by remember(state?.javaClass) { mutableStateOf("") }
+    val label: String
+    val go: () -> Unit
+    when (state) {
+        is TdApi.AuthorizationStateWaitPhoneNumber -> {
+            label = "Телефон (+7...)"
+            go = { Td.send(TdApi.SetAuthenticationPhoneNumber(text, null)) }
+        }
+        is TdApi.AuthorizationStateWaitCode -> {
+            label = "Код из Telegram"
+            go = { Td.send(TdApi.CheckAuthenticationCode(text)) }
+        }
+        is TdApi.AuthorizationStateWaitPassword -> {
+            label = "Пароль 2FA"
+            go = { Td.send(TdApi.CheckAuthenticationPassword(text)) }
+        }
+        else -> { label = "Подключение…"; go = {} }
+    }
+    Column(Modifier.fillMaxSize().padding(32.dp), Arrangement.Center) {
+        Text("Prisma", fontSize = 40.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(24.dp))
+        OutlinedTextField(
+            text, { text = it }, Modifier.fillMaxWidth(),
+            label = { Text(label) }, singleLine = true
+        )
+        Spacer(Modifier.height(16.dp))
+        Button(go, Modifier.fillMaxWidth()) { Text("Далее") }
+    }
+}
+
+/* ---------------------- СПИСОК ЧАТОВ ---------------------- */
+
+@Composable
+fun ChatList(onOpen: (TdApi.Chat) -> Unit, onProfile: () -> Unit) {
+    val chats by Td.chats.collectAsState()
+    val me by Td.me.collectAsState()
+    Column(Modifier.fillMaxSize().statusBarsPadding()) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+            Arrangement.SpaceBetween, Alignment.CenterVertically
+        ) {
+            Text("Prisma", fontSize = 26.sp, fontWeight = FontWeight.Bold)
+            TextButton(onProfile) { Text(me?.firstName ?: "Профиль") }
+        }
+        LazyColumn(Modifier.weight(1f)) {
+            items(chats, key = { it.id }) { c ->
+                Column(
+                    Modifier.fillMaxWidth().clickable { onOpen(c) }
+                        .padding(horizontal = 16.dp, vertical = 10.dp)
+                ) {
+                    Text(c.title, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                    Text(preview(c.lastMessage), color = Color.Gray, maxLines = 1)
+                }
+            }
+        }
+    }
+}
+
+/* ---------------------- ЭКРАН ЧАТА ---------------------- */
+
+@Composable
+fun ChatBackground(style: ChatStyle, content: @Composable BoxScope.() -> Unit) {
+    Box(
+        Modifier.fillMaxSize().background(
+            Brush.verticalGradient(listOf(Color(style.bgTop), Color(style.bgBottom)))
+        ),
+        content = content
+    )
+}
+
+@Composable
+fun MessageBubble(text: String, outgoing: Boolean, style: ChatStyle) {
+    val r = style.corner.dp
+    val shape = RoundedCornerShape(
+        topStart = r, topEnd = r,
+        bottomStart = if (outgoing) r else 4.dp,
+        bottomEnd = if (outgoing) 4.dp else r
+    )
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 3.dp),
+        horizontalArrangement = if (outgoing) Arrangement.End else Arrangement.Start
+    ) {
+        Box(
+            Modifier.widthIn(max = 300.dp)
+                .background(Color(if (outgoing) style.bubbleOut else style.bubbleIn), shape)
+                .padding(horizontal = 12.dp, vertical = 8.dp)
+        ) {
+            Text(
+                text,
+                color = Color(if (outgoing) style.textOut else style.textIn),
+                fontSize = (16 * style.fontScale).sp
+            )
+        }
+    }
+}
+
+@Composable
+fun ChatScreen(s: Screen.Chat, store: StyleStore, back: () -> Unit, edit: () -> Unit) {
+    val style by store.styleFlow(s.id).collectAsState(ChatStyle())
+    val msgs by Td.messages.collectAsState()
+    var input by remember { mutableStateOf("") }
+    LaunchedEffect(s.id) { Td.openChat(s.id) }
+    ChatBackground(style) {
+        Column(Modifier.fillMaxSize().statusBarsPadding().imePadding()) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                TextButton(back) { Text("←") }
+                Text(
+                    s.title, Modifier.weight(1f), color = Color.White,
+                    fontWeight = FontWeight.Bold, maxLines = 1
+                )
+                TextButton(edit) { Text("🎨") }
+            }
+            LazyColumn(Modifier.weight(1f), reverseLayout = true) {
+                items(msgs, key = { it.id }) {
+                    MessageBubble(preview(it), it.isOutgoing, style)
+                }
+            }
+            Row(
+                Modifier.fillMaxWidth().navigationBarsPadding().padding(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OutlinedTextField(
+                    input, { input = it }, Modifier.weight(1f),
+                    placeholder = { Text("Сообщение") }
+                )
+                Spacer(Modifier.width(8.dp))
+                Button({
+                    if (input.isNotBlank()) { Td.sendText(s.id, input.trim()); input = "" }
+                }) { Text("➤") }
+            }
+        }
+    }
+}
+
+/* ---------------------- ПРОФИЛЬ ---------------------- */
+
+@Composable
+fun ProfileScreen(back: () -> Unit) {
+    val me by Td.me.collectAsState()
+    var first by remember(me?.id) { mutableStateOf(me?.firstName ?: "") }
+    var last by remember(me?.id) { mutableStateOf(me?.lastName ?: "") }
+    var bio by remember { mutableStateOf("") }
+    var user by remember(me?.id) { mutableStateOf(me?.usernames?.editableUsername ?: "") }
+    Column(
+        Modifier.fillMaxSize().statusBarsPadding().padding(16.dp)
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        TextButton(back) { Text("← Назад") }
+        Text("Мой профиль", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+        OutlinedTextField(first, { first = it }, Modifier.fillMaxWidth(), label = { Text("Имя") })
+        OutlinedTextField(last, { last = it }, Modifier.fillMaxWidth(), label = { Text("Фамилия") })
+        OutlinedTextField(user, { user = it }, Modifier.fillMaxWidth(), label = { Text("Username") })
+        OutlinedTextField(bio, { bio = it }, Modifier.fillMaxWidth(), label = { Text("О себе") })
+        Button({
+            Td.send(TdApi.SetName(first, last))
+            Td.send(TdApi.SetBio(bio))
+            if (user.isNotBlank()) Td.send(TdApi.SetUsername(user))
+            back()
+        }, Modifier.fillMaxWidth()) { Text("Сохранить") }
+        OutlinedButton({ Td.send(TdApi.LogOut()) }, Modifier.fillMaxWidth()) { Text("Выйти") }
+    }
+}
+
+/* ---------------------- РЕДАКТОР ТЕМЫ ЧАТА ---------------------- */
+
+val PALETTE = listOf(
+    0xFF6C5CE7, 0xFFE84393, 0xFF0984E3, 0xFF00B894, 0xFFFDCB6E, 0xFFD63031,
+    0xFF2D3436, 0xFF0F0C29, 0xFF302B63, 0xFF1B1464, 0xFF6F1E51, 0xFF000000
+)
+
+@Composable
+fun Palette(sel: Long, pick: (Long) -> Unit) {
+    Row(
+        Modifier.horizontalScroll(rememberScrollState()).padding(vertical = 6.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        PALETTE.forEach { c ->
+            Box(
+                Modifier.size(36.dp).clip(CircleShape).background(Color(c))
+                    .border(if (c == sel) 3.dp else 1.dp, Color.White, CircleShape)
+                    .clickable { pick(c) }
+            )
+        }
+    }
+}
+
+@Composable
+fun StyleScreen(chatId: Long, store: StyleStore, done: () -> Unit) {
+    val saved by store.styleFlow(chatId).collectAsState(ChatStyle())
+    var st by remember(saved) { mutableStateOf(saved) }
+    val scope = rememberCoroutineScope()
+    ChatBackground(st) {
+        Column(
+            Modifier.fillMaxSize().statusBarsPadding().padding(12.dp)
+                .verticalScroll(rememberScrollState())
+        ) {
+            MessageBubble("Привет! Так выглядят чужие сообщения", false, st)
+            MessageBubble("А так — твои", true, st)
+            Spacer(Modifier.height(12.dp))
+            Text("Мои сообщения", color = Color.White)
+            Palette(st.bubbleOut) { st = st.copy(bubbleOut = it) }
+            Text("Чужие сообщения", color = Color.White)
+            Palette(st.bubbleIn) { st = st.copy(bubbleIn = it) }
+            Text("Фон сверху", color = Color.White)
+            Palette(st.bgTop) { st = st.copy(bgTop = it) }
+            Text("Фон снизу", color = Color.White)
+            Palette(st.bgBottom) { st = st.copy(bgBottom = it) }
+            Text("Скругление: ${st.corner}", color = Color.White)
+            Slider(st.corner.toFloat(), { st = st.copy(corner = it.toInt()) }, valueRange = 2f..32f)
+            Text("Размер текста: ${"%.1f".format(st.fontScale)}x", color = Color.White)
+            Slider(st.fontScale, { st = st.copy(fontScale = it) }, valueRange = 0.8f..1.6f)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button({ scope.launch { store.save(chatId, st); done() } }) { Text("Для чата") }
+                Button({ scope.launch { store.save(0, st); done() } }) { Text("Для всех") }
+                OutlinedButton({ scope.launch { store.reset(chatId); done() } }) { Text("Сброс") }
+            }
+        }
+    }
+}
+package com.prisma.app
+
+import android.content.Context
+import android.os.Build
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.*
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.datastore.preferences.core.*
+import androidx.datastore.preferences.preferencesDataStore
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import org.drinkless.tdlib.Client
+import org.drinkless.tdlib.TdApi
+import java.util.concurrent.ConcurrentHashMap
+
+// ============ ВПИШИ СВОИ ДАННЫЕ С my.telegram.org ============
+const val API_ID = 0
+const val API_HASH = ""
+// ==============================================================
+
+/* ---------------------- СТИЛИ ---------------------- */
+
+@Serializable
+data class ChatStyle(
+    val bubbleOut: Long = 0xFF6C5CE7,
+    val bubbleIn: Long = 0xFF2D3436,
+    val textOut: Long = 0xFFFFFFFF,
+    val textIn: Long = 0xFFEEEEEE,
+    val bgTop: Long = 0xFF0F0C29,
+    val bgBottom: Long = 0xFF302B63,
+    val corner: Int = 18,
+    val fontScale: Float = 1f
+)
+
+private val Context.ds by preferencesDataStore("prisma_styles")
+
+class StyleStore(private val ctx: Context) {
+    private val json = Json { ignoreUnknownKeys = true }
+    private fun key(id: Long) = stringPreferencesKey("chat_$id")
+    private fun decode(s: String?) =
+        s?.let { runCatching { json.decodeFromString<ChatStyle>(it) }.getOrNull() }
+
+    /** chatId = 0 — общий стиль для всех чатов */
+    fun styleFlow(chatId: Long): Flow<ChatStyle> = ctx.ds.data.map { p ->
+        decode(p[key(chatId)]) ?: decode(p[key(0)]) ?: ChatStyle()
+    }
+
+    suspend fun save(chatId: Long, s: ChatStyle) {
+        ctx.ds.edit { it[key(chatId)] = json.encodeToString(s) }
+    }
+
+    suspend fun reset(chatId: Long) {
+        ctx.ds.edit { it.remove(key(chatId)) }
+    }
+}
+
+/* ---------------------- TELEGRAM (TDLib) ---------------------- */
+
+object Td {
+    private lateinit var client: Client
+    private var started = false
+    private var dir = ""
+    private var currentChat = 0L
+    private val chatMap = ConcurrentHashMap<Long, TdApi.Chat>()
+
+    val auth = MutableStateFlow<TdApi.AuthorizationState?>(null)
+    val chats = MutableStateFlow<List<TdApi.Chat>>(emptyList())
+    val messages = MutableStateFlow<List<TdApi.Message>>(emptyList())
+    val me = MutableStateFlow<TdApi.User?>(null)
+
+    fun init(ctx: Context) {
+        if (started) return
+        started = true
+        dir = ctx.filesDir.absolutePath
+        Client.execute(TdApi.SetLogVerbosityLevel(1))
+        client = Client.create({ onUpdate(it) }, null, null)
+    }
+
+    fun send(f: TdApi.Function<*>, cb: ((TdApi.Object) -> Unit)? = null) {
+        client.send(f) { cb?.invoke(it) }
+    }
+
+    private fun push() {
+        chats.value = chatMap.values.sortedByDescending { it.lastMessage?.date ?: 0 }
+    }
+
+    private fun onUpdate(o: TdApi.Object) {
+        when (o) {
+            is TdApi.UpdateAuthorizationState -> onAuth(o.authorizationState)
+            is TdApi.UpdateNewChat -> { chatMap[o.chat.id] = o.chat; push() }
+            is TdApi.UpdateChatTitle -> { chatMap[o.chatId]?.title = o.title; push() }
+            is TdApi.UpdateChatLastMessage -> {
+                chatMap[o.chatId]?.lastMessage = o.lastMessage
+                push()
+            }
+            is TdApi.UpdateNewMessage ->
+                if (o.message.chatId == currentChat) messages.update { listOf(o.message) + it }
+            is TdApi.UpdateUser -> if (o.user.id == me.value?.id) me.value = o.user
+            else -> {}
+        }
+    }
+
+    private fun onAuth(s: TdApi.AuthorizationState) {
+        auth.value = s
+        when (s) {
+            is TdApi.AuthorizationStateWaitTdlibParameters -> send(
+                TdApi.SetTdlibParameters().apply {
+                    useTestDc = false
+                    databaseDirectory = "$dir/td"
+                    filesDirectory = "$dir/files"
+                    databaseEncryptionKey = ByteArray(0)
+                    useFileDatabase = true
+                    useChatInfoDatabase = true
+                    useMessageDatabase = true
+                    useSecretChats = false
+                    apiId = API_ID
+                    apiHash = API_HASH
+                    systemLanguageCode = "ru"
+                    deviceModel = Build.MODEL
+                    systemVersion = Build.VERSION.RELEASE
+                    applicationVersion = "0.1"
+                }
+            )
+            is TdApi.AuthorizationStateReady -> {
+                send(TdApi.LoadChats(TdApi.ChatListMain(), 100))
+                send(TdApi.GetMe()) { if (it is TdApi.User) me.value = it }
+            }
+            else -> {}
+        }
+    }
+
+    fun openChat(id: Long) {
+        currentChat = id
+        messages.value = emptyList()
+        send(TdApi.GetChatHistory(id, 0, 0, 50, false)) {
+            if (it is TdApi.Messages) messages.value = it.messages.toList()
+        }
+    }
+
+    fun sendText(chatId: Long, text: String) {
+        send(TdApi.SendMessage().apply {
+            this.chatId = chatId
+            inputMessageContent = TdApi.InputMessageText().apply {
+                this.text = TdApi.FormattedText(text, emptyArray())
+            }
+        })
+    }
+}
+
+fun preview(m: TdApi.Message?): String = when (val c = m?.content) {
+    null -> ""
+    is TdApi.MessageText -> c.text.text
+    else -> "📎 вложение"
+}
+
+/* ---------------------- ACTIVITY ---------------------- */
+
+sealed class Screen {
+    object Chats : Screen()
+    object Profile : Screen()
+    data class Chat(val id: Long, val title: String) : Screen()
+    data class Style(val id: Long, val title: String) : Screen()
+}
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        Td.init(applicationContext)
+        val store = StyleStore(applicationContext)
+        setContent {
+            MaterialTheme(colorScheme = darkColorScheme()) { PrismaApp(store) }
+        }
+    }
+}
+
+@Composable
+fun PrismaApp(store: StyleStore) {
+    val auth by Td.auth.collectAsState()
+    var screen by remember { mutableStateOf<Screen>(Screen.Chats) }
+    Surface(Modifier.fillMaxSize()) {
+        if (auth is TdApi.AuthorizationStateReady) {
+            when (val s = screen) {
+                is Screen.Chats -> ChatList(
+                    onOpen = { screen = Screen.Chat(it.id, it.title) },
+                    onProfile = { screen = Screen.Profile }
+                )
+                is Screen.Chat -> ChatScreen(
+                    s, store,
+                    back = { screen = Screen.Chats },
+                    edit = { screen = Screen.Style(s.id, s.title) }
+                )
+                is Screen.Profile -> ProfileScreen { screen = Screen.Chats }
+                is Screen.Style -> StyleScreen(s.id, store) { screen = Screen.Chat(s.id, s.title) }
+            }
+        } else LoginScreen(auth)
+    }
+}
+
+/* ---------------------- ВХОД ---------------------- */
+
+@Composable
+fun LoginScreen(state: TdApi.AuthorizationState?) {
+    var text by remember(state?.javaClass) { mutableStateOf("") }
+    val label: String
+    val go: () -> Unit
+    when (state) {
+        is TdApi.AuthorizationStateWaitPhoneNumber -> {
+            label = "Телефон (+7...)"
+            go = { Td.send(TdApi.SetAuthenticationPhoneNumber(text, null)) }
+        }
+        is TdApi.AuthorizationStateWaitCode -> {
+            label = "Код из Telegram"
+            go = { Td.send(TdApi.CheckAuthenticationCode(text)) }
+        }
+        is TdApi.AuthorizationStateWaitPassword -> {
+            label = "Пароль 2FA"
+            go = { Td.send(TdApi.CheckAuthenticationPassword(text)) }
+        }
+        else -> { label = "Подключение…"; go = {} }
+    }
+    Column(Modifier.fillMaxSize().padding(32.dp), Arrangement.Center) {
+        Text("Prisma", fontSize = 40.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(24.dp))
+        OutlinedTextField(
+            text, { text = it }, Modifier.fillMaxWidth(),
+            label = { Text(label) }, singleLine = true
+        )
+        Spacer(Modifier.height(16.dp))
+        Button(go, Modifier.fillMaxWidth()) { Text("Далее") }
+    }
+}
+
+/* ---------------------- СПИСОК ЧАТОВ ---------------------- */
+
+@Composable
+fun ChatList(onOpen: (TdApi.Chat) -> Unit, onProfile: () -> Unit) {
+    val chats by Td.chats.collectAsState()
+    val me by Td.me.collectAsState()
+    Column(Modifier.fillMaxSize().statusBarsPadding()) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+            Arrangement.SpaceBetween, Alignment.CenterVertically
+        ) {
+            Text("Prisma", fontSize = 26.sp, fontWeight = FontWeight.Bold)
+            TextButton(onProfile) { Text(me?.firstName ?: "Профиль") }
+        }
+        LazyColumn(Modifier.weight(1f)) {
+            items(chats, key = { it.id }) { c ->
+                Column(
+                    Modifier.fillMaxWidth().clickable { onOpen(c) }
+                        .padding(horizontal = 16.dp, vertical = 10.dp)
+                ) {
+                    Text(c.title, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                    Text(preview(c.lastMessage), color = Color.Gray, maxLines = 1)
+                }
+            }
+        }
+    }
+}
+
+/* ---------------------- ЭКРАН ЧАТА ---------------------- */
+
+@Composable
+fun ChatBackground(style: ChatStyle, content: @Composable BoxScope.() -> Unit) {
+    Box(
+        Modifier.fillMaxSize().background(
+            Brush.verticalGradient(listOf(Color(style.bgTop), Color(style.bgBottom)))
+        ),
+        content = content
+    )
+}
+
+@Composable
+fun MessageBubble(text: String, outgoing: Boolean, style: ChatStyle) {
+    val r = style.corner.dp
+    val shape = RoundedCornerShape(
+        topStart = r, topEnd = r,
+        bottomStart = if (outgoing) r else 4.dp,
+        bottomEnd = if (outgoing) 4.dp else r
+    )
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 3.dp),
+        horizontalArrangement = if (outgoing) Arrangement.End else Arrangement.Start
+    ) {
+        Box(
+            Modifier.widthIn(max = 300.dp)
+                .background(Color(if (outgoing) style.bubbleOut else style.bubbleIn), shape)
+                .padding(horizontal = 12.dp, vertical = 8.dp)
+        ) {
+            Text(
+                text,
+                color = Color(if (outgoing) style.textOut else style.textIn),
+                fontSize = (16 * style.fontScale).sp
+            )
+        }
+    }
+}
+
+@Composable
+fun ChatScreen(s: Screen.Chat, store: StyleStore, back: () -> Unit, edit: () -> Unit) {
+    val style by store.styleFlow(s.id).collectAsState(ChatStyle())
+    val msgs by Td.messages.collectAsState()
+    var input by remember { mutableStateOf("") }
+    LaunchedEffect(s.id) { Td.openChat(s.id) }
+    ChatBackground(style) {
+        Column(Modifier.fillMaxSize().statusBarsPadding().imePadding()) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                TextButton(back) { Text("←") }
+                Text(
+                    s.title, Modifier.weight(1f), color = Color.White,
+                    fontWeight = FontWeight.Bold, maxLines = 1
+                )
+                TextButton(edit) { Text("🎨") }
+            }
+            LazyColumn(Modifier.weight(1f), reverseLayout = true) {
+                items(msgs, key = { it.id }) {
+                    MessageBubble(preview(it), it.isOutgoing, style)
+                }
+            }
+            Row(
+                Modifier.fillMaxWidth().navigationBarsPadding().padding(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OutlinedTextField(
+                    input, { input = it }, Modifier.weight(1f),
+                    placeholder = { Text("Сообщение") }
+                )
+                Spacer(Modifier.width(8.dp))
+                Button({
+                    if (input.isNotBlank()) { Td.sendText(s.id, input.trim()); input = "" }
+                }) { Text("➤") }
+            }
+        }
+    }
+}
+
+/* ---------------------- ПРОФИЛЬ ---------------------- */
+
+@Composable
+fun ProfileScreen(back: () -> Unit) {
+    val me by Td.me.collectAsState()
+    var first by remember(me?.id) { mutableStateOf(me?.firstName ?: "") }
+    var last by remember(me?.id) { mutableStateOf(me?.lastName ?: "") }
+    var bio by remember { mutableStateOf("") }
+    var user by remember(me?.id) { mutableStateOf(me?.usernames?.editableUsername ?: "") }
+    Column(
+        Modifier.fillMaxSize().statusBarsPadding().padding(16.dp)
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        TextButton(back) { Text("← Назад") }
+        Text("Мой профиль", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+        OutlinedTextField(first, { first = it }, Modifier.fillMaxWidth(), label = { Text("Имя") })
+        OutlinedTextField(last, { last = it }, Modifier.fillMaxWidth(), label = { Text("Фамилия") })
+        OutlinedTextField(user, { user = it }, Modifier.fillMaxWidth(), label = { Text("Username") })
+        OutlinedTextField(bio, { bio = it }, Modifier.fillMaxWidth(), label = { Text("О себе") })
+        Button({
+            Td.send(TdApi.SetName(first, last))
+            Td.send(TdApi.SetBio(bio))
+            if (user.isNotBlank()) Td.send(TdApi.SetUsername(user))
+            back()
+        }, Modifier.fillMaxWidth()) { Text("Сохранить") }
+        OutlinedButton({ Td.send(TdApi.LogOut()) }, Modifier.fillMaxWidth()) { Text("Выйти") }
+    }
+}
+
+/* ---------------------- РЕДАКТОР ТЕМЫ ЧАТА ---------------------- */
+
+val PALETTE = listOf(
+    0xFF6C5CE7, 0xFFE84393, 0xFF0984E3, 0xFF00B894, 0xFFFDCB6E, 0xFFD63031,
+    0xFF2D3436, 0xFF0F0C29, 0xFF302B63, 0xFF1B1464, 0xFF6F1E51, 0xFF000000
+)
+
+@Composable
+fun Palette(sel: Long, pick: (Long) -> Unit) {
+    Row(
+        Modifier.horizontalScroll(rememberScrollState()).padding(vertical = 6.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        PALETTE.forEach { c ->
+            Box(
+                Modifier.size(36.dp).clip(CircleShape).background(Color(c))
+                    .border(if (c == sel) 3.dp else 1.dp, Color.White, CircleShape)
+                    .clickable { pick(c) }
+            )
+        }
+    }
+}
+
+@Composable
+fun StyleScreen(chatId: Long, store: StyleStore, done: () -> Unit) {
+    val saved by store.styleFlow(chatId).collectAsState(ChatStyle())
+    var st by remember(saved) { mutableStateOf(saved) }
+    val scope = rememberCoroutineScope()
+    ChatBackground(st) {
+        Column(
+            Modifier.fillMaxSize().statusBarsPadding().padding(12.dp)
+                .verticalScroll(rememberScrollState())
+        ) {
+            MessageBubble("Привет! Так выглядят чужие сообщения", false, st)
+            MessageBubble("А так — твои", true, st)
+            Spacer(Modifier.height(12.dp))
+            Text("Мои сообщения", color = Color.White)
+            Palette(st.bubbleOut) { st = st.copy(bubbleOut = it) }
+            Text("Чужие сообщения", color = Color.White)
+            Palette(st.bubbleIn) { st = st.copy(bubbleIn = it) }
+            Text("Фон сверху", color = Color.White)
+            Palette(st.bgTop) { st = st.copy(bgTop = it) }
+            Text("Фон снизу", color = Color.White)
+            Palette(st.bgBottom) { st = st.copy(bgBottom = it) }
+            Text("Скругление: ${st.corner}", color = Color.White)
+            Slider(st.corner.toFloat(), { st = st.copy(corner = it.toInt()) }, valueRange = 2f..32f)
+            Text("Размер текста: ${"%.1f".format(st.fontScale)}x", color = Color.White)
+            Slider(st.fontScale, { st = st.copy(fontScale = it) }, valueRange = 0.8f..1.6f)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button({ scope.launch { store.save(chatId, st); done() } }) { Text("Для чата") }
+                Button({ scope.launch { store.save(0, st); done() } }) { Text("Для всех") }
+                OutlinedButton({ scope.launch { store.reset(chatId); done() } }) { Text("Сброс") }
+            }
+        }
+    }
+}
+package com.prisma.app
+
+import android.content.Context
+import android.os.Build
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.*
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.datastore.preferences.core.*
+import androidx.datastore.preferences.preferencesDataStore
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import org.drinkless.tdlib.Client
+import org.drinkless.tdlib.TdApi
+import java.util.concurrent.ConcurrentHashMap
+
+// ============ ВПИШИ СВОИ ДАННЫЕ С my.telegram.org ============
+const val API_ID = 0
+const val API_HASH = ""
+// ==============================================================
+
+/* ---------------------- СТИЛИ ---------------------- */
+
+@Serializable
+data class ChatStyle(
+    val bubbleOut: Long = 0xFF6C5CE7,
+    val bubbleIn: Long = 0xFF2D3436,
+    val textOut: Long = 0xFFFFFFFF,
+    val textIn: Long = 0xFFEEEEEE,
+    val bgTop: Long = 0xFF0F0C29,
+    val bgBottom: Long = 0xFF302B63,
+    val corner: Int = 18,
+    val fontScale: Float = 1f
+)
+
+private val Context.ds by preferencesDataStore("prisma_styles")
+
+class StyleStore(private val ctx: Context) {
+    private val json = Json { ignoreUnknownKeys = true }
+    private fun key(id: Long) = stringPreferencesKey("chat_$id")
+    private fun decode(s: String?) =
+        s?.let { runCatching { json.decodeFromString<ChatStyle>(it) }.getOrNull() }
+
+    /** chatId = 0 — общий стиль для всех чатов */
+    fun styleFlow(chatId: Long): Flow<ChatStyle> = ctx.ds.data.map { p ->
+        decode(p[key(chatId)]) ?: decode(p[key(0)]) ?: ChatStyle()
+    }
+
+    suspend fun save(chatId: Long, s: ChatStyle) {
+        ctx.ds.edit { it[key(chatId)] = json.encodeToString(s) }
+    }
+
+    suspend fun reset(chatId: Long) {
+        ctx.ds.edit { it.remove(key(chatId)) }
+    }
+}
+
+/* ---------------------- TELEGRAM (TDLib) ---------------------- */
+
+object Td {
+    private lateinit var client: Client
+    private var started = false
+    private var dir = ""
+    private var currentChat = 0L
+    private val chatMap = ConcurrentHashMap<Long, TdApi.Chat>()
+
+    val auth = MutableStateFlow<TdApi.AuthorizationState?>(null)
+    val chats = MutableStateFlow<List<TdApi.Chat>>(emptyList())
+    val messages = MutableStateFlow<List<TdApi.Message>>(emptyList())
+    val me = MutableStateFlow<TdApi.User?>(null)
+
+    fun init(ctx: Context) {
+        if (started) return
+        started = true
+        dir = ctx.filesDir.absolutePath
+        Client.execute(TdApi.SetLogVerbosityLevel(1))
+        client = Client.create({ onUpdate(it) }, null, null)
+    }
+
+    fun send(f: TdApi.Function<*>, cb: ((TdApi.Object) -> Unit)? = null) {
+        client.send(f) { cb?.invoke(it) }
+    }
+
+    private fun push() {
+        chats.value = chatMap.values.sortedByDescending { it.lastMessage?.date ?: 0 }
+    }
+
+    private fun onUpdate(o: TdApi.Object) {
+        when (o) {
+            is TdApi.UpdateAuthorizationState -> onAuth(o.authorizationState)
+            is TdApi.UpdateNewChat -> { chatMap[o.chat.id] = o.chat; push() }
+            is TdApi.UpdateChatTitle -> { chatMap[o.chatId]?.title = o.title; push() }
+            is TdApi.UpdateChatLastMessage -> {
+                chatMap[o.chatId]?.lastMessage = o.lastMessage
+                push()
+            }
+            is TdApi.UpdateNewMessage ->
+                if (o.message.chatId == currentChat) messages.update { listOf(o.message) + it }
+            is TdApi.UpdateUser -> if (o.user.id == me.value?.id) me.value = o.user
+            else -> {}
+        }
+    }
+
+    private fun onAuth(s: TdApi.AuthorizationState) {
+        auth.value = s
+        when (s) {
+            is TdApi.AuthorizationStateWaitTdlibParameters -> send(
+                TdApi.SetTdlibParameters().apply {
+                    useTestDc = false
+                    databaseDirectory = "$dir/td"
+                    filesDirectory = "$dir/files"
+                    databaseEncryptionKey = ByteArray(0)
+                    useFileDatabase = true
+                    useChatInfoDatabase = true
+                    useMessageDatabase = true
+                    useSecretChats = false
+                    apiId = API_ID
+                    apiHash = API_HASH
+                    systemLanguageCode = "ru"
+                    deviceModel = Build.MODEL
+                    systemVersion = Build.VERSION.RELEASE
+                    applicationVersion = "0.1"
+                }
+            )
+            is TdApi.AuthorizationStateReady -> {
+                send(TdApi.LoadChats(TdApi.ChatListMain(), 100))
+                send(TdApi.GetMe()) { if (it is TdApi.User) me.value = it }
+            }
+            else -> {}
+        }
+    }
+
+    fun openChat(id: Long) {
+        currentChat = id
+        messages.value = emptyList()
+        send(TdApi.GetChatHistory(id, 0, 0, 50, false)) {
+            if (it is TdApi.Messages) messages.value = it.messages.toList()
+        }
+    }
+
+    fun sendText(chatId: Long, text: String) {
+        send(TdApi.SendMessage().apply {
+            this.chatId = chatId
+            inputMessageContent = TdApi.InputMessageText().apply {
+                this.text = TdApi.FormattedText(text, emptyArray())
+            }
+        })
+    }
+}
+
+fun preview(m: TdApi.Message?): String = when (val c = m?.content) {
+    null -> ""
+    is TdApi.MessageText -> c.text.text
+    else -> "📎 вложение"
+}
+
+/* ---------------------- ACTIVITY ---------------------- */
+
+sealed class Screen {
+    object Chats : Screen()
+    object Profile : Screen()
+    data class Chat(val id: Long, val title: String) : Screen()
+    data class Style(val id: Long, val title: String) : Screen()
+}
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        Td.init(applicationContext)
+        val store = StyleStore(applicationContext)
+        setContent {
+            MaterialTheme(colorScheme = darkColorScheme()) { PrismaApp(store) }
+        }
+    }
+}
+
+@Composable
+fun PrismaApp(store: StyleStore) {
+    val auth by Td.auth.collectAsState()
+    var screen by remember { mutableStateOf<Screen>(Screen.Chats) }
+    Surface(Modifier.fillMaxSize()) {
+        if (auth is TdApi.AuthorizationStateReady) {
+            when (val s = screen) {
+                is Screen.Chats -> ChatList(
+                    onOpen = { screen = Screen.Chat(it.id, it.title) },
+                    onProfile = { screen = Screen.Profile }
+                )
+                is Screen.Chat -> ChatScreen(
+                    s, store,
+                    back = { screen = Screen.Chats },
+                    edit = { screen = Screen.Style(s.id, s.title) }
+                )
+                is Screen.Profile -> ProfileScreen { screen = Screen.Chats }
+                is Screen.Style -> StyleScreen(s.id, store) { screen = Screen.Chat(s.id, s.title) }
+            }
+        } else LoginScreen(auth)
+    }
+}
+
+/* ---------------------- ВХОД ---------------------- */
+
+@Composable
+fun LoginScreen(state: TdApi.AuthorizationState?) {
+    var text by remember(state?.javaClass) { mutableStateOf("") }
+    val label: String
+    val go: () -> Unit
+    when (state) {
+        is TdApi.AuthorizationStateWaitPhoneNumber -> {
+            label = "Телефон (+7...)"
+            go = { Td.send(TdApi.SetAuthenticationPhoneNumber(text, null)) }
+        }
+        is TdApi.AuthorizationStateWaitCode -> {
+            label = "Код из Telegram"
+            go = { Td.send(TdApi.CheckAuthenticationCode(text)) }
+        }
+        is TdApi.AuthorizationStateWaitPassword -> {
+            label = "Пароль 2FA"
+            go = { Td.send(TdApi.CheckAuthenticationPassword(text)) }
+        }
+        else -> { label = "Подключение…"; go = {} }
+    }
+    Column(Modifier.fillMaxSize().padding(32.dp), Arrangement.Center) {
+        Text("Prisma", fontSize = 40.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(24.dp))
+        OutlinedTextField(
+            text, { text = it }, Modifier.fillMaxWidth(),
+            label = { Text(label) }, singleLine = true
+        )
+        Spacer(Modifier.height(16.dp))
+        Button(go, Modifier.fillMaxWidth()) { Text("Далее") }
+    }
+}
+
+/* ---------------------- СПИСОК ЧАТОВ ---------------------- */
+
+@Composable
+fun ChatList(onOpen: (TdApi.Chat) -> Unit, onProfile: () -> Unit) {
+    val chats by Td.chats.collectAsState()
+    val me by Td.me.collectAsState()
+    Column(Modifier.fillMaxSize().statusBarsPadding()) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+            Arrangement.SpaceBetween, Alignment.CenterVertically
+        ) {
+            Text("Prisma", fontSize = 26.sp, fontWeight = FontWeight.Bold)
+            TextButton(onProfile) { Text(me?.firstName ?: "Профиль") }
+        }
+        LazyColumn(Modifier.weight(1f)) {
+            items(chats, key = { it.id }) { c ->
+                Column(
+                    Modifier.fillMaxWidth().clickable { onOpen(c) }
+                        .padding(horizontal = 16.dp, vertical = 10.dp)
+                ) {
+                    Text(c.title, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                    Text(preview(c.lastMessage), color = Color.Gray, maxLines = 1)
+                }
+            }
+        }
+    }
+}
+
+/* ---------------------- ЭКРАН ЧАТА ---------------------- */
+
+@Composable
+fun ChatBackground(style: ChatStyle, content: @Composable BoxScope.() -> Unit) {
+    Box(
+        Modifier.fillMaxSize().background(
+            Brush.verticalGradient(listOf(Color(style.bgTop), Color(style.bgBottom)))
+        ),
+        content = content
+    )
+}
+
+@Composable
+fun MessageBubble(text: String, outgoing: Boolean, style: ChatStyle) {
+    val r = style.corner.dp
+    val shape = RoundedCornerShape(
+        topStart = r, topEnd = r,
+        bottomStart = if (outgoing) r else 4.dp,
+        bottomEnd = if (outgoing) 4.dp else r
+    )
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 3.dp),
+        horizontalArrangement = if (outgoing) Arrangement.End else Arrangement.Start
+    ) {
+        Box(
+            Modifier.widthIn(max = 300.dp)
+                .background(Color(if (outgoing) style.bubbleOut else style.bubbleIn), shape)
+                .padding(horizontal = 12.dp, vertical = 8.dp)
+        ) {
+            Text(
+                text,
+                color = Color(if (outgoing) style.textOut else style.textIn),
+                fontSize = (16 * style.fontScale).sp
+            )
+        }
+    }
+}
+
+@Composable
+fun ChatScreen(s: Screen.Chat, store: StyleStore, back: () -> Unit, edit: () -> Unit) {
+    val style by store.styleFlow(s.id).collectAsState(ChatStyle())
+    val msgs by Td.messages.collectAsState()
+    var input by remember { mutableStateOf("") }
+    LaunchedEffect(s.id) { Td.openChat(s.id) }
+    ChatBackground(style) {
+        Column(Modifier.fillMaxSize().statusBarsPadding().imePadding()) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                TextButton(back) { Text("←") }
+                Text(
+                    s.title, Modifier.weight(1f), color = Color.White,
+                    fontWeight = FontWeight.Bold, maxLines = 1
+                )
+                TextButton(edit) { Text("🎨") }
+            }
+            LazyColumn(Modifier.weight(1f), reverseLayout = true) {
+                items(msgs, key = { it.id }) {
+                    MessageBubble(preview(it), it.isOutgoing, style)
+                }
+            }
+            Row(
+                Modifier.fillMaxWidth().navigationBarsPadding().padding(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OutlinedTextField(
+                    input, { input = it }, Modifier.weight(1f),
+                    placeholder = { Text("Сообщение") }
+                )
+                Spacer(Modifier.width(8.dp))
+                Button({
+                    if (input.isNotBlank()) { Td.sendText(s.id, input.trim()); input = "" }
+                }) { Text("➤") }
+            }
+        }
+    }
+}
+
+/* ---------------------- ПРОФИЛЬ ---------------------- */
+
+@Composable
+fun ProfileScreen(back: () -> Unit) {
+    val me by Td.me.collectAsState()
+    var first by remember(me?.id) { mutableStateOf(me?.firstName ?: "") }
+    var last by remember(me?.id) { mutableStateOf(me?.lastName ?: "") }
+    var bio by remember { mutableStateOf("") }
+    var user by remember(me?.id) { mutableStateOf(me?.usernames?.editableUsername ?: "") }
+    Column(
+        Modifier.fillMaxSize().statusBarsPadding().padding(16.dp)
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        TextButton(back) { Text("← Назад") }
+        Text("Мой профиль", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+        OutlinedTextField(first, { first = it }, Modifier.fillMaxWidth(), label = { Text("Имя") })
+        OutlinedTextField(last, { last = it }, Modifier.fillMaxWidth(), label = { Text("Фамилия") })
+        OutlinedTextField(user, { user = it }, Modifier.fillMaxWidth(), label = { Text("Username") })
+        OutlinedTextField(bio, { bio = it }, Modifier.fillMaxWidth(), label = { Text("О себе") })
+        Button({
+            Td.send(TdApi.SetName(first, last))
+            Td.send(TdApi.SetBio(bio))
+            if (user.isNotBlank()) Td.send(TdApi.SetUsername(user))
+            back()
+        }, Modifier.fillMaxWidth()) { Text("Сохранить") }
+        OutlinedButton({ Td.send(TdApi.LogOut()) }, Modifier.fillMaxWidth()) { Text("Выйти") }
+    }
+}
+
+/* ---------------------- РЕДАКТОР ТЕМЫ ЧАТА ---------------------- */
+
+val PALETTE = listOf(
+    0xFF6C5CE7, 0xFFE84393, 0xFF0984E3, 0xFF00B894, 0xFFFDCB6E, 0xFFD63031,
+    0xFF2D3436, 0xFF0F0C29, 0xFF302B63, 0xFF1B1464, 0xFF6F1E51, 0xFF000000
+)
+
+@Composable
+fun Palette(sel: Long, pick: (Long) -> Unit) {
+    Row(
+        Modifier.horizontalScroll(rememberScrollState()).padding(vertical = 6.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        PALETTE.forEach { c ->
+            Box(
+                Modifier.size(36.dp).clip(CircleShape).background(Color(c))
+                    .border(if (c == sel) 3.dp else 1.dp, Color.White, CircleShape)
+                    .clickable { pick(c) }
+            )
+        }
+    }
+}
+
+@Composable
+fun StyleScreen(chatId: Long, store: StyleStore, done: () -> Unit) {
+    val saved by store.styleFlow(chatId).collectAsState(ChatStyle())
+    var st by remember(saved) { mutableStateOf(saved) }
+    val scope = rememberCoroutineScope()
+    ChatBackground(st) {
+        Column(
+            Modifier.fillMaxSize().statusBarsPadding().padding(12.dp)
+                .verticalScroll(rememberScrollState())
+        ) {
+            MessageBubble("Привет! Так выглядят чужие сообщения", false, st)
+            MessageBubble("А так — твои", true, st)
+            Spacer(Modifier.height(12.dp))
+            Text("Мои сообщения", color = Color.White)
+            Palette(st.bubbleOut) { st = st.copy(bubbleOut = it) }
+            Text("Чужие сообщения", color = Color.White)
+            Palette(st.bubbleIn) { st = st.copy(bubbleIn = it) }
+            Text("Фон сверху", color = Color.White)
+            Palette(st.bgTop) { st = st.copy(bgTop = it) }
+            Text("Фон снизу", color = Color.White)
+            Palette(st.bgBottom) { st = st.copy(bgBottom = it) }
+            Text("Скругление: ${st.corner}", color = Color.White)
+            Slider(st.corner.toFloat(), { st = st.copy(corner = it.toInt()) }, valueRange = 2f..32f)
+            Text("Размер текста: ${"%.1f".format(st.fontScale)}x", color = Color.White)
+            Slider(st.fontScale, { st = st.copy(fontScale = it) }, valueRange = 0.8f..1.6f)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button({ scope.launch { store.save(chatId, st); done() } }) { Text("Для чата") }
+                Button({ scope.launch { store.save(0, st); done() } }) { Text("Для всех") }
+                OutlinedButton({ scope.launch { store.reset(chatId); done() } }) { Text("Сброс") }
+            }
+        }
+    }
+}
+GitHub ActionsGitHub Actionscom.prisma.appcom.prisma.appandroid.os.Buildandroid.content.Contextandroid.os.Buildandroid.content.Contextandroid.os.Buildcom.prisma.appcom.prisma.appandroid.os.BuildGitHub Actionsandroid.os.Buildandroid.content.Contextpackage com.prisma.app
+
+import android.content.Context
+import android.os.Build
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.*
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.datastore.preferences.core.*
+import androidx.datastore.preferences.preferencesDataStore
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import org.drinkless.tdlib.Client
+import org.drinkless.tdlib.TdApi
+import java.util.concurrent.ConcurrentHashMap
+
+// ============ ВПИШИ СВОИ ДАННЫЕ С my.telegram.org ============
+const val API_ID = 0
+const val API_HASH = ""
+// ==============================================================
+
+/* ---------------------- СТИЛИ ---------------------- */
+
+@Serializable
+data class ChatStyle(
+    val bubbleOut: Long = 0xFF6C5CE7,
+    val bubbleIn: Long = 0xFF2D3436,
+    val textOut: Long = 0xFFFFFFFF,
+    val textIn: Long = 0xFFEEEEEE,
+    val bgTop: Long = 0xFF0F0C29,
+    val bgBottom: Long = 0xFF302B63,
+    val corner: Int = 18,
+    val fontScale: Float = 1f
+)
+
+private val Context.ds by preferencesDataStore("prisma_styles")
+
+class StyleStore(private val ctx: Context) {
+    private val json = Json { ignoreUnknownKeys = true }
+    private fun key(id: Long) = stringPreferencesKey("chat_$id")
+    private fun decode(s: String?) =
+        s?.let { runCatching { json.decodeFromString<ChatStyle>(it) }.getOrNull() }
+
+    /** chatId = 0 — общий стиль для всех чатов */
+    fun styleFlow(chatId: Long): Flow<ChatStyle> = ctx.ds.data.map { p ->
+        decode(p[key(chatId)]) ?: decode(p[key(0)]) ?: ChatStyle()
+    }
+
+    suspend fun save(chatId: Long, s: ChatStyle) {
+        ctx.ds.edit { it[key(chatId)] = json.encodeToString(s) }
+    }
+
+    suspend fun reset(chatId: Long) {
+        ctx.ds.edit { it.remove(key(chatId)) }
+    }
+}
+
+/* ---------------------- TELEGRAM (TDLib) ---------------------- */
+
+object Td {
+    private lateinit var client: Client
+    private var started = false
+    private var dir = ""
+    private var currentChat = 0L
+    private val chatMap = ConcurrentHashMap<Long, TdApi.Chat>()
+
+    val auth = MutableStateFlow<TdApi.AuthorizationState?>(null)
+    val chats = MutableStateFlow<List<TdApi.Chat>>(emptyList())
+    val messages = MutableStateFlow<List<TdApi.Message>>(emptyList())
+    val me = MutableStateFlow<TdApi.User?>(null)
+
+    fun init(ctx: Context) {
+        if (started) return
+        started = true
+        dir = ctx.filesDir.absolutePath
+        Client.execute(TdApi.SetLogVerbosityLevel(1))
+        client = Client.create({ onUpdate(it) }, null, null)
+    }
+
+    fun send(f: TdApi.Function<*>, cb: ((TdApi.Object) -> Unit)? = null) {
+        client.send(f) { cb?.invoke(it) }
+    }
+
+    private fun push() {
+        chats.value = chatMap.values.sortedByDescending { it.lastMessage?.date ?: 0 }
+    }
+
+    private fun onUpdate(o: TdApi.Object) {
+        when (o) {
+            is TdApi.UpdateAuthorizationState -> onAuth(o.authorizationState)
+            is TdApi.UpdateNewChat -> { chatMap[o.chat.id] = o.chat; push() }
+            is TdApi.UpdateChatTitle -> { chatMap[o.chatId]?.title = o.title; push() }
+            is TdApi.UpdateChatLastMessage -> {
+                chatMap[o.chatId]?.lastMessage = o.lastMessage
+                push()
+            }
+            is TdApi.UpdateNewMessage ->
+                if (o.message.chatId == currentChat) messages.update { listOf(o.message) + it }
+            is TdApi.UpdateUser -> if (o.user.id == me.value?.id) me.value = o.user
+            else -> {}
+        }
+    }
+
+    private fun onAuth(s: TdApi.AuthorizationState) {
+        auth.value = s
+        when (s) {
+            is TdApi.AuthorizationStateWaitTdlibParameters -> send(
+                TdApi.SetTdlibParameters().apply {
+                    useTestDc = false
+                    databaseDirectory = "$dir/td"
+                    filesDirectory = "$dir/files"
+                    databaseEncryptionKey = ByteArray(0)
+                    useFileDatabase = true
+                    useChatInfoDatabase = true
+                    useMessageDatabase = true
+                    useSecretChats = false
+                    apiId = API_ID
+                    apiHash = API_HASH
+                    systemLanguageCode = "ru"
+                    deviceModel = Build.MODEL
+                    systemVersion = Build.VERSION.RELEASE
+                    applicationVersion = "0.1"
+                }
+            )
+            is TdApi.AuthorizationStateReady -> {
+                send(TdApi.LoadChats(TdApi.ChatListMain(), 100))
+                send(TdApi.GetMe()) { if (it is TdApi.User) me.value = it }
+            }
+            else -> {}
+        }
+    }
+
+    fun openChat(id: Long) {
+        currentChat = id
+        messages.value = emptyList()
+        send(TdApi.GetChatHistory(id, 0, 0, 50, false)) {
+            if (it is TdApi.Messages) messages.value = it.messages.toList()
+        }
+    }
+
+    fun sendText(chatId: Long, text: String) {
+        send(TdApi.SendMessage().apply {
+            this.chatId = chatId
+            inputMessageContent = TdApi.InputMessageText().apply {
+                this.text = TdApi.FormattedText(text, emptyArray())
+            }
+        })
+    }
+}
+
+fun preview(m: TdApi.Message?): String = when (val c = m?.content) {
+    null -> ""
+    is TdApi.MessageText -> c.text.text
+    else -> "📎 вложение"
+}
+
+/* ---------------------- ACTIVITY ---------------------- */
+
+sealed class Screen {
+    object Chats : Screen()
+    object Profile : Screen()
+    data class Chat(val id: Long, val title: String) : Screen()
+    data class Style(val id: Long, val title: String) : Screen()
+}
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        Td.init(applicationContext)
+        val store = StyleStore(applicationContext)
+        setContent {
+            MaterialTheme(colorScheme = darkColorScheme()) { PrismaApp(store) }
+        }
+    }
+}
+
+@Composable
+fun PrismaApp(store: StyleStore) {
+    val auth by Td.auth.collectAsState()
+    var screen by remember { mutableStateOf<Screen>(Screen.Chats) }
+    Surface(Modifier.fillMaxSize()) {
+        if (auth is TdApi.AuthorizationStateReady) {
+            when (val s = screen) {
+                is Screen.Chats -> ChatList(
+                    onOpen = { screen = Screen.Chat(it.id, it.title) },
+                    onProfile = { screen = Screen.Profile }
+                )
+                is Screen.Chat -> ChatScreen(
+                    s, store,
+                    back = { screen = Screen.Chats },
+                    edit = { screen = Screen.Style(s.id, s.title) }
+                )
+                is Screen.Profile -> ProfileScreen { screen = Screen.Chats }
+                is Screen.Style -> StyleScreen(s.id, store) { screen = Screen.Chat(s.id, s.title) }
+            }
+        } else LoginScreen(auth)
+    }
+}
+
+/* ---------------------- ВХОД ---------------------- */
+
+@Composable
+fun LoginScreen(state: TdApi.AuthorizationState?) {
+    var text by remember(state?.javaClass) { mutableStateOf("") }
+    val label: String
+    val go: () -> Unit
+    when (state) {
+        is TdApi.AuthorizationStateWaitPhoneNumber -> {
+            label = "Телефон (+7...)"
+            go = { Td.send(TdApi.SetAuthenticationPhoneNumber(text, null)) }
+        }
+        is TdApi.AuthorizationStateWaitCode -> {
+            label = "Код из Telegram"
+            go = { Td.send(TdApi.CheckAuthenticationCode(text)) }
+        }
+        is TdApi.AuthorizationStateWaitPassword -> {
+            label = "Пароль 2FA"
+            go = { Td.send(TdApi.CheckAuthenticationPassword(text)) }
+        }
+        else -> { label = "Подключение…"; go = {} }
+    }
+    Column(Modifier.fillMaxSize().padding(32.dp), Arrangement.Center) {
+        Text("Prisma", fontSize = 40.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(24.dp))
+        OutlinedTextField(
+            text, { text = it }, Modifier.fillMaxWidth(),
+            label = { Text(label) }, singleLine = true
+        )
+        Spacer(Modifier.height(16.dp))
+        Button(go, Modifier.fillMaxWidth()) { Text("Далее") }
+    }
+}
+
+/* ---------------------- СПИСОК ЧАТОВ ---------------------- */
+
+@Composable
+fun ChatList(onOpen: (TdApi.Chat) -> Unit, onProfile: () -> Unit) {
+    val chats by Td.chats.collectAsState()
+    val me by Td.me.collectAsState()
+    Column(Modifier.fillMaxSize().statusBarsPadding()) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+            Arrangement.SpaceBetween, Alignment.CenterVertically
+        ) {
+            Text("Prisma", fontSize = 26.sp, fontWeight = FontWeight.Bold)
+            TextButton(onProfile) { Text(me?.firstName ?: "Профиль") }
+        }
+        LazyColumn(Modifier.weight(1f)) {
+            items(chats, key = { it.id }) { c ->
+                Column(
+                    Modifier.fillMaxWidth().clickable { onOpen(c) }
+                        .padding(horizontal = 16.dp, vertical = 10.dp)
+                ) {
+                    Text(c.title, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                    Text(preview(c.lastMessage), color = Color.Gray, maxLines = 1)
+                }
+            }
+        }
+    }
+}
+
+/* ---------------------- ЭКРАН ЧАТА ---------------------- */
+
+@Composable
+fun ChatBackground(style: ChatStyle, content: @Composable BoxScope.() -> Unit) {
+    Box(
+        Modifier.fillMaxSize().background(
+            Brush.verticalGradient(listOf(Color(style.bgTop), Color(style.bgBottom)))
+        ),
+        content = content
+    )
+}
+
+@Composable
+fun MessageBubble(text: String, outgoing: Boolean, style: ChatStyle) {
+    val r = style.corner.dp
+    val shape = RoundedCornerShape(
+        topStart = r, topEnd = r,
+        bottomStart = if (outgoing) r else 4.dp,
+        bottomEnd = if (outgoing) 4.dp else r
+    )
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 3.dp),
+        horizontalArrangement = if (outgoing) Arrangement.End else Arrangement.Start
+    ) {
+        Box(
+            Modifier.widthIn(max = 300.dp)
+                .background(Color(if (outgoing) style.bubbleOut else style.bubbleIn), shape)
+                .padding(horizontal = 12.dp, vertical = 8.dp)
+        ) {
+            Text(
+                text,
+                color = Color(if (outgoing) style.textOut else style.textIn),
+                fontSize = (16 * style.fontScale).sp
+            )
+        }
+    }
+}
+
+@Composable
+fun ChatScreen(s: Screen.Chat, store: StyleStore, back: () -> Unit, edit: () -> Unit) {
+    val style by store.styleFlow(s.id).collectAsState(ChatStyle())
+    val msgs by Td.messages.collectAsState()
+    var input by remember { mutableStateOf("") }
+    LaunchedEffect(s.id) { Td.openChat(s.id) }
+    ChatBackground(style) {
+        Column(Modifier.fillMaxSize().statusBarsPadding().imePadding()) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                TextButton(back) { Text("←") }
+                Text(
+                    s.title, Modifier.weight(1f), color = Color.White,
+                    fontWeight = FontWeight.Bold, maxLines = 1
+                )
+                TextButton(edit) { Text("🎨") }
+            }
+            LazyColumn(Modifier.weight(1f), reverseLayout = true) {
+                items(msgs, key = { it.id }) {
+                    MessageBubble(preview(it), it.isOutgoing, style)
+                }
+            }
+            Row(
+                Modifier.fillMaxWidth().navigationBarsPadding().padding(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OutlinedTextField(
+                    input, { input = it }, Modifier.weight(1f),
+                    placeholder = { Text("Сообщение") }
+                )
+                Spacer(Modifier.width(8.dp))
+                Button({
+                    if (input.isNotBlank()) { Td.sendText(s.id, input.trim()); input = "" }
+                }) { Text("➤") }
+            }
+        }
+    }
+}
+
+/* ---------------------- ПРОФИЛЬ ---------------------- */
+
+@Composable
+fun ProfileScreen(back: () -> Unit) {
+    val me by Td.me.collectAsState()
+    var first by remember(me?.id) { mutableStateOf(me?.firstName ?: "") }
+    var last by remember(me?.id) { mutableStateOf(me?.lastName ?: "") }
+    var bio by remember { mutableStateOf("") }
+    var user by remember(me?.id) { mutableStateOf(me?.usernames?.editableUsername ?: "") }
+    Column(
+        Modifier.fillMaxSize().statusBarsPadding().padding(16.dp)
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        TextButton(back) { Text("← Назад") }
+        Text("Мой профиль", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+        OutlinedTextField(first, { first = it }, Modifier.fillMaxWidth(), label = { Text("Имя") })
+        OutlinedTextField(last, { last = it }, Modifier.fillMaxWidth(), label = { Text("Фамилия") })
+        OutlinedTextField(user, { user = it }, Modifier.fillMaxWidth(), label = { Text("Username") })
+        OutlinedTextField(bio, { bio = it }, Modifier.fillMaxWidth(), label = { Text("О себе") })
+        Button({
+            Td.send(TdApi.SetName(first, last))
+            Td.send(TdApi.SetBio(bio))
+            if (user.isNotBlank()) Td.send(TdApi.SetUsername(user))
+            back()
+        }, Modifier.fillMaxWidth()) { Text("Сохранить") }
+        OutlinedButton({ Td.send(TdApi.LogOut()) }, Modifier.fillMaxWidth()) { Text("Выйти") }
+    }
+}
+
+/* ---------------------- РЕДАКТОР ТЕМЫ ЧАТА ---------------------- */
+
+val PALETTE = listOf(
+    0xFF6C5CE7, 0xFFE84393, 0xFF0984E3, 0xFF00B894, 0xFFFDCB6E, 0xFFD63031,
+    0xFF2D3436, 0xFF0F0C29, 0xFF302B63, 0xFF1B1464, 0xFF6F1E51, 0xFF000000
+)
+
+@Composable
+fun Palette(sel: Long, pick: (Long) -> Unit) {
+    Row(
+        Modifier.horizontalScroll(rememberScrollState()).padding(vertical = 6.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        PALETTE.forEach { c ->
+            Box(
+                Modifier.size(36.dp).clip(CircleShape).background(Color(c))
+                    .border(if (c == sel) 3.dp else 1.dp, Color.White, CircleShape)
+                    .clickable { pick(c) }
+            )
+        }
+    }
+}
+
+@Composable
+fun StyleScreen(chatId: Long, store: StyleStore, done: () -> Unit) {
+    val saved by store.styleFlow(chatId).collectAsState(ChatStyle())
+    var st by remember(saved) { mutableStateOf(saved) }
+    val scope = rememberCoroutineScope()
+    ChatBackground(st) {
+        Column(
+            Modifier.fillMaxSize().statusBarsPadding().padding(12.dp)
+                .verticalScroll(rememberScrollState())
+        ) {
+            MessageBubble("Привет! Так выглядят чужие сообщения", false, st)
+            MessageBubble("А так — твои", true, st)
+            Spacer(Modifier.height(12.dp))
+            Text("Мои сообщения", color = Color.White)
+            Palette(st.bubbleOut) { st = st.copy(bubbleOut = it) }
+            Text("Чужие сообщения", color = Color.White)
+            Palette(st.bubbleIn) { st = st.copy(bubbleIn = it) }
+            Text("Фон сверху", color = Color.White)
+            Palette(st.bgTop) { st = st.copy(bgTop = it) }
+            Text("Фон снизу", color = Color.White)
+            Palette(st.bgBottom) { st = st.copy(bgBottom = it) }
+            Text("Скругление: ${st.corner}", color = Color.White)
+            Slider(st.corner.toFloat(), { st = st.copy(corner = it.toInt()) }, valueRange = 2f..32f)
+            Text("Размер текста: ${"%.1f".format(st.fontScale)}x", color = Color.White)
+            Slider(st.fontScale, { st = st.copy(fontScale = it) }, valueRange = 0.8f..1.6f)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button({ scope.launch { store.save(chatId, st); done() } }) { Text("Для чата") }
+                Button({ scope.launch { store.save(0, st); done() } }) { Text("Для всех") }
+                OutlinedButton({ scope.launch { store.reset(chatId); done() } }) { Text("Сброс") }
+            }
+        }
+    }
+}
+
+
+
+
